@@ -31,6 +31,18 @@ TI_SCREEN_ROWS = 24
 DOT_MAX_W = TI_SCREEN_COLS * 8
 DOT_MAX_H = TI_SCREEN_ROWS * 8
 
+# TI character codes 0..31 are reserved for control characters; code 32 is
+# the space character that CALL CLEAR fills the screen with. We therefore
+# never redefine codes <= 32 — the user-facing 'Char code start' is clamped
+# to MIN_USER_CODE.
+SPACE_CODE = 32
+MIN_USER_CODE = 33
+
+# Private sentinel for 'this cell is background and need not be placed'. Kept
+# distinct from SPACE_CODE so a user-assigned code 32 would never collide
+# with the skip-placements optimisation in _format_basic.
+_BACKGROUND = -1
+
 
 @dataclass
 class CharCell:
@@ -72,56 +84,31 @@ class ConversionResult:
 # Step 1 — pixelate
 # ---------------------------------------------------------------------------
 
-def _resample_nearest(
-    src: bytes, src_w: int, src_h: int, dst_w: int, dst_h: int, channels: int
-) -> bytearray:
-    """Nearest-neighbour resample of packed pixel bytes."""
-    out = bytearray(dst_w * dst_h * channels)
-    for y in range(dst_h):
-        sy = (y * src_h) // dst_h
-        if sy >= src_h:
-            sy = src_h - 1
-        src_row_off = sy * src_w * channels
-        dst_row_off = y * dst_w * channels
-        for x in range(dst_w):
-            sx = (x * src_w) // dst_w
-            if sx >= src_w:
-                sx = src_w - 1
-            s = src_row_off + sx * channels
-            d = dst_row_off + x * channels
-            out[d : d + channels] = src[s : s + channels]
-    return out
-
-
-def _luminance_bits(
-    pixels: bytearray, width: int, height: int, channels: int, threshold: int
-) -> list[list[int]]:
-    """Return a height-by-width matrix of 0/1, with 1 meaning 'foreground (ink)'.
-
-    Krita gives BGRA bytes (channels=4). Pixel is ink if its luminance is
-    darker than the threshold, so dark strokes on a light canvas become set
-    bits (the natural TI black-ink-on-light-background reading).
+def _luminance_per_pixel(
+    pixels: bytes, width: int, height: int, channels: int
+) -> list[int]:
+    """Flatten the BGRA buffer into a length-(width*height) list of luminance
+    values in 0..255. Fully transparent pixels are clamped to 255 so they
+    read as background. Computed once per pixelate() call and then summed
+    over cell rectangles, which is far cheaper than re-reading the BGRA
+    buffer for every cell.
     """
-    bits = [[0] * width for _ in range(height)]
-    for y in range(height):
-        row_off = y * width * channels
-        row = bits[y]
-        for x in range(width):
-            p = row_off + x * channels
-            if channels >= 3:
-                b = pixels[p]
-                g = pixels[p + 1]
-                r = pixels[p + 2]
-                a = pixels[p + 3] if channels >= 4 else 255
-            else:
-                r = g = b = pixels[p]
-                a = 255
+    out = [0] * (width * height)
+    if channels >= 3:
+        for i in range(width * height):
+            p = i * channels
+            b = pixels[p]
+            g = pixels[p + 1]
+            r = pixels[p + 2]
+            a = pixels[p + 3] if channels >= 4 else 255
             if a < 16:
-                lum = 255  # transparent reads as background
+                out[i] = 255  # transparent reads as background
             else:
-                lum = (299 * r + 587 * g + 114 * b) // 1000
-            row[x] = 1 if lum < threshold else 0
-    return bits
+                out[i] = (299 * r + 587 * g + 114 * b) // 1000
+    else:
+        for i in range(width * height):
+            out[i] = pixels[i * channels]
+    return out
 
 
 def pixelate(
@@ -133,12 +120,16 @@ def pixelate(
     threshold: int = 128,
     channels: int = 4,
 ) -> PixelatedImage:
-    """Step 1: turn the Krita image into a TI-resolution 1-bit matrix.
+    """Step 1: divide the source rect into ``dot_cols`` x ``dot_rows`` cells
+    of their natural pixel size (``src_width / dot_cols`` x
+    ``src_height / dot_rows``) and pick black or white for each cell from
+    the AVERAGE LUMINANCE of all pixels falling inside it. The source image
+    is never resampled or rescaled — every source pixel contributes exactly
+    once to exactly one cell.
 
-    ``dot_cols`` and ``dot_rows`` are the requested pixel dimensions of the
-    interpolated image. They are rounded down to a multiple of 8 and clamped
-    to the TI screen (256x192 dots) so the picture decomposes cleanly into
-    8x8 character cells.
+    ``dot_cols`` and ``dot_rows`` are rounded down to a multiple of 8 and
+    clamped to the TI screen (256x192 dots) so the picture decomposes
+    cleanly into 8x8 character cells.
     """
     if dot_cols < 8 or dot_rows < 8:
         raise ValueError("dot columns and rows must be at least 8")
@@ -148,11 +139,43 @@ def pixelate(
         raise ValueError("source image has zero size")
     if len(pixels) < src_width * src_height * channels:
         raise ValueError("pixel buffer is smaller than width*height*channels")
+    if src_width < dot_cols or src_height < dot_rows:
+        raise ValueError(
+            "source rect is smaller than the dot grid — pick fewer dots, or "
+            "make the selection / canvas larger"
+        )
 
-    resampled = _resample_nearest(
-        pixels, src_width, src_height, dot_cols, dot_rows, channels
-    )
-    bits = _luminance_bits(resampled, dot_cols, dot_rows, channels, threshold)
+    lum = _luminance_per_pixel(pixels, src_width, src_height, channels)
+
+    # Cell boundaries computed as ``(idx * src) // dots`` so every source
+    # pixel falls into exactly one cell with no overlap or gaps. Cells on
+    # the right/bottom edges may be one source pixel wider/taller than the
+    # rest when the dot grid doesn't divide the source size evenly.
+    x_bounds = [(cx * src_width) // dot_cols for cx in range(dot_cols + 1)]
+    y_bounds = [(cy * src_height) // dot_rows for cy in range(dot_rows + 1)]
+
+    bits = [[0] * dot_cols for _ in range(dot_rows)]
+    for cy in range(dot_rows):
+        y0 = y_bounds[cy]
+        y1 = y_bounds[cy + 1]
+        if y1 <= y0:
+            y1 = y0 + 1
+        bit_row = bits[cy]
+        for cx in range(dot_cols):
+            x0 = x_bounds[cx]
+            x1 = x_bounds[cx + 1]
+            if x1 <= x0:
+                x1 = x0 + 1
+            total = 0
+            count = 0
+            for yy in range(y0, y1):
+                row_off = yy * src_width
+                for xx in range(x0, x1):
+                    total += lum[row_off + xx]
+                    count += 1
+            avg = total // count if count else 255
+            bit_row[cx] = 1 if avg < threshold else 0
+
     return PixelatedImage(
         dot_cols=dot_cols,
         dot_rows=dot_rows,
@@ -233,10 +256,10 @@ def _assign_codes(
     code_end: int,
 ) -> tuple[list[CharCell], list[list[int]], int]:
     """Build the unique character table and the layout grid for codes in
-    ``[code_start..code_end]``. All-zero cells map to code 32 (space) and
-    do not consume a slot. Returns ``(cells, layout, snapped)`` where
-    ``snapped`` counts cells that had to merge onto a neighbour because the
-    code range was exhausted.
+    ``[code_start..code_end]``. All-zero (background) cells are tagged with
+    the private ``_BACKGROUND`` sentinel and never consume a code slot.
+    Returns ``(cells, layout, snapped)`` where ``snapped`` counts cells that
+    had to merge onto a neighbour because the code range was exhausted.
     """
     pattern_to_code: dict[tuple[int, ...], int] = {}
     cells: list[CharCell] = []
@@ -249,7 +272,7 @@ def _assign_codes(
         for cx in range(char_cols):
             pat = _pattern_for_cell(bits, cx, cy)
             if all(b == 0 for b in pat):
-                row_layout.append(32)
+                row_layout.append(_BACKGROUND)
                 continue
             code = pattern_to_code.get(pat)
             if code is None:
@@ -272,8 +295,8 @@ def _assign_codes(
                     code = best_code
                     snapped += 1
                 else:
-                    # No range at all — drop to space.
-                    code = 32
+                    # No range at all — drop to background (will not be placed).
+                    code = _BACKGROUND
                     snapped += 1
             row_layout.append(code)
         layout.append(row_layout)
@@ -302,6 +325,8 @@ def _format_basic(
     offset_row = max(0, (TI_SCREEN_ROWS - char_rows) // 2)
 
     # Collapse runs of identical codes on each row into one CALL HCHAR(...,count).
+    # Background cells (sentinel value) are skipped because CALL CLEAR has
+    # already filled the screen with code 32 (space).
     for r in range(char_rows):
         c = 0
         while c < char_cols:
@@ -310,8 +335,8 @@ def _format_basic(
             while run_end < char_cols and layout[r][run_end] == code:
                 run_end += 1
             run_len = run_end - c
-            if code == 32:
-                c = run_end  # CALL CLEAR filled the screen with spaces already
+            if code == _BACKGROUND:
+                c = run_end
                 continue
             ti_row = r + offset_row + 1
             ti_col = c + offset_col + 1
@@ -331,11 +356,20 @@ def bits_to_basic(
     code_start: int,
     code_end: int,
 ) -> ConversionResult:
-    """Step 2: turn a pixelated bit matrix into a TI Extended BASIC program."""
-    if code_start < 32 or code_end > 255 or code_start > code_end:
+    """Step 2: turn a pixelated bit matrix into a TI Extended BASIC program.
+
+    ``code_start`` is silently clamped up to ``MIN_USER_CODE`` (33) because
+    code 32 is the space character that CALL CLEAR fills the screen with —
+    redefining it would mean every 'untouched' cell on the TI screen shows
+    the redefined pattern instead of staying blank.
+    """
+    if code_end > 255 or code_start > code_end:
         raise ValueError(
-            "character code range must satisfy 32 <= start <= end <= 255"
+            f"character code range must satisfy start <= end <= 255 "
+            f"(got start={code_start}, end={code_end})"
         )
+    if code_start < MIN_USER_CODE:
+        code_start = MIN_USER_CODE
     cells, layout, snapped = _assign_codes(
         pixel_img.char_cols, pixel_img.char_rows, pixel_img.bits, code_start, code_end
     )
