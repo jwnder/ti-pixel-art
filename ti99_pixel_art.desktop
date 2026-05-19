@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=ti99_pixel_art
+X-Python-2-Compatible=false
+Name=TI-99/4A Pixel Art
+Comment=Convert the current Krita image into TI Extended BASIC CALL CHAR / CALL HCHAR code
